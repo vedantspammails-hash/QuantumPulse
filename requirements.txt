@@ -3,3 +3,4 @@ python-dotenv
 python-telegram-bot
 pytz
 requests
+cryptography
