@@ -1,4 +1,4 @@
-binance
+python-binance
 python-dotenv
 python-telegram-bot
 pytz
