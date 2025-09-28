@@ -19,7 +19,6 @@ BINANCE_API_KEY = os.getenv("API_KEY")
 BINANCE_API_SECRET = os.getenv("API_SECRET")
 IST = pytz.timezone("Asia/Kolkata")
 
-# FUNDING RATE THRESHOLD (-0.5% as decimal); change here for future updates
 FUNDING_RATE_THRESHOLD = -0.005
 INITIAL_TRADE_USDT = 50
 NEXT_TRADE_CAPITAL_PCT = 0.99
@@ -63,15 +62,15 @@ def get_public_ip():
         return None
 
 def verify_binance_api():
-    # Try connecting and getting account info
     try:
         client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=False)
         log_info("Binance client initialized.")
-        # Check account status, permissions
         acc_status = client.futures_account()
-        log_info(f"Binance futures account loaded: {acc_status['canTrade']}, {acc_status['updateTime']}")
+        log_info(f"Binance futures account loaded: canTrade={acc_status['canTrade']}, updateTime={acc_status['updateTime']}")
         send_telegram_to_all(
-            f"✅ <b>Binance API Verified</b>\nFutures trading enabled: <b>{acc_status['canTrade']}</b>\nUpdateTime: <b>{acc_status['updateTime']}</b>"
+            f"✅ <b>Binance API Verified</b>\n"
+            f"Futures trading enabled: <b>{acc_status['canTrade']}</b>\n"
+            f"API UpdateTime: <b>{acc_status['updateTime']}</b>"
         )
         return client
     except BinanceAPIException as e:
@@ -101,8 +100,7 @@ def verify_bot_startup():
         log_error("Aborting: Binance API verification failed.")
         exit(1)
     log_info("All startup checks passed.")
-    send_telegram_to_all("✅ <b>Bot Startup Verification Passed</b>\nBot is online and ready.")
-
+    send_telegram_to_all("✅ <b>Bot Startup Verification Passed</b>\nBot is online and ready for scanning.")
     return client
 
 def format_time(dt):
@@ -144,7 +142,7 @@ def get_funding_data(symbol):
         return {
             "symbol": symbol,
             "fundingRate": float(data.get("lastFundingRate", 0)),
-            "nextFundingTime": int(data.get("nextFundingTime", 0)),  # ms
+            "nextFundingTime": int(data.get("nextFundingTime", 0)),
             "price": float(data.get("markPrice", 0)),
         }
     except Exception as e:
@@ -225,7 +223,7 @@ def close_market_long(client, symbol, qty):
         return None
 
 def truncate_qty(price, capital):
-    if price <= 0: 
+    if price <= 0:
         log_error(f"Price <= 0 for qty calc, returning 0")
         return 0
     qty = int(capital / price)
@@ -233,15 +231,11 @@ def truncate_qty(price, capital):
     return qty if qty > 0 else 0
 
 def scan_opportunities(client):
-    log_info("Scanning funding rate opportunities on Binance USDT-margined perpetual futures...")
+    log_info("=== [SCAN STARTED] Scanning funding rate opportunities on Binance USDT-margined perpetual futures ===")
     start_time = time.time()
     symbols = get_binance_usdt_perpetual_symbols()
     num_scanned = len(symbols)
     log_info(f"Total pairs scanned: {num_scanned}")
-
-    trade_active = False
-    current_trade = {}
-    trade_planned = False
 
     funding_results = []
     log_info("Fetching funding rates and prices in parallel...")
@@ -266,9 +260,12 @@ def scan_opportunities(client):
                 err = funding.get("error", "No funding info")
                 log_error(f"[{idx}/{num_scanned}] {symbol} | [WARN] {err}")
 
-    log_info("Funding fetch complete. Checking for opportunities...")
+    end_scan_time = time.time()
+    scan_duration = end_scan_time - start_time
+    log_info(f"Funding fetch for all {num_scanned} symbols complete. Scan duration: {scan_duration:.2f}s")
 
-    # Main logic: Only one trade at a time
+    # Shortlist signals according to your rules:
+    shortlisted_signals = []
     for funding in funding_results:
         symbol = funding["symbol"]
         rate = funding.get("fundingRate")
@@ -280,154 +277,177 @@ def scan_opportunities(client):
         funding_time_utc = datetime.fromtimestamp(funding_time_utc, tz=pytz.UTC)
         funding_time_ist = funding_time_utc.astimezone(IST)
         now_ist = datetime.now(IST)
-        time_to_funding = (funding_time_ist - now_ist).total_seconds()
-
-        if not trade_active and rate <= FUNDING_RATE_THRESHOLD and time_to_funding > 3000:  # >50 mins
-            planned_entry_time = funding_time_ist - timedelta(minutes=50)
-            time_to_entry = (planned_entry_time - now_ist).total_seconds()
-            qty = truncate_qty(price, INITIAL_TRADE_USDT)
-            if qty == 0 or time_to_entry < 0:
-                log_info(f"Skipped {symbol}: qty=0 or entry time passed.")
-                continue
-            msg = (
-                f"🚦 <b>Trade Planned!</b>\n"
-                f"Coin: <b>{symbol}</b>\n"
-                f"Price: {price}\n"
-                f"Funding Rate: {rate:.4f}\n"
-                f"Qty: <b>{qty}</b>\n"
-                f"Entry at (IST): <b>{format_time(planned_entry_time)}</b>\n"
-                f"Funding Round Ends (IST): <b>{format_time(funding_time_ist)}</b>\n"
-                f"Time Remaining: <b>{format_time_remaining(time_to_funding)}</b>"
-            )
-            log_info(msg.replace('\n', ' '))
-            send_telegram_to_all(msg)
-            trade_active = True
-            trade_planned = True
-            current_trade = {
+        time_to_funding = (funding_time_ist - now_ist).total_seconds() - scan_duration
+        # Only shortlist signals that pass both conditions
+        if rate < FUNDING_RATE_THRESHOLD and 0 < time_to_funding < 3600:
+            shortlisted_signals.append({
                 "symbol": symbol,
-                "planned_entry_time": planned_entry_time,
-                "funding_end_time": funding_time_ist,
-                "qty": qty,
-                "price": price,
-                "rate": rate
-            }
-            break
+                "fundingRate": rate,
+                "funding_time_ist": funding_time_ist,
+                "time_to_funding": time_to_funding,
+                "price": price
+            })
 
-    if not trade_planned:
-        end_time = time.time()
-        duration_str = f"{end_time - start_time:.2f} seconds"
-        summary = (
-            "<b>No trade found in this scan.</b>\n"
-            f"Coins scanned: <b>{num_scanned}</b>\n"
-            f"Time taken: <b>{duration_str}</b>"
+    shortlisted_signals.sort(key=lambda x: x['time_to_funding'])
+    summary_msg = (
+        f"🔍 <b>Scan Summary</b>\n"
+        f"Total Symbols Scanned: <b>{num_scanned}</b>\n"
+        f"Time Taken: <b>{scan_duration:.2f} seconds</b>\n"
+        f"Signals Passing Criteria: <b>{len(shortlisted_signals)}</b>"
+    )
+    send_telegram_to_all(summary_msg)
+    log_info(summary_msg.replace('\n', ' '))
+
+    if not shortlisted_signals:
+        send_telegram_to_all("⛔ <b>No qualifying trade found in this scan.</b>")
+        log_info("No shortlisted signals. Scan complete.")
+        return
+
+    # Try signals one by one, only one trade at a time
+    for idx, signal in enumerate(shortlisted_signals):
+        symbol = signal['symbol']
+        rate = signal['fundingRate']
+        funding_time_ist = signal['funding_time_ist']
+        time_to_funding = signal['time_to_funding']
+        price = signal['price']
+
+        planned_entry_time = funding_time_ist - timedelta(minutes=50)
+        time_to_entry = (planned_entry_time - datetime.now(IST)).total_seconds()
+        qty = truncate_qty(price, INITIAL_TRADE_USDT)
+        if qty == 0 or time_to_entry < 0:
+            log_info(f"Skipped {symbol}: qty=0 or entry time passed.")
+            continue
+        plan_msg = (
+            f"🗂️ <b>Trade Plan #{idx+1}</b>\n"
+            f"Symbol: <b>{symbol}</b>\n"
+            f"Price: <b>{price}</b>\n"
+            f"Funding Rate: <b>{rate:.4f}</b>\n"
+            f"Qty: <b>{qty}</b>\n"
+            f"Planned Entry (IST): <b>{format_time(planned_entry_time)}</b>\n"
+            f"Funding Round Ends (IST): <b>{format_time(funding_time_ist)}</b>\n"
+            f"Funding Time Left: <b>{format_time_remaining(time_to_funding)}</b>"
         )
-        log_info(summary.replace('\n', ' '))
-        send_telegram_to_all(summary)
+        send_telegram_to_all(plan_msg)
+        log_info(plan_msg.replace('\n', ' '))
 
-    # Execute planned trade
-    if trade_active and current_trade:
-        symbol = current_trade['symbol']
-        planned_entry_time = current_trade['planned_entry_time']
-        funding_end_time = current_trade['funding_end_time']
-        qty = current_trade['qty']
-        entry_price = current_trade['price']
-
-        # Wait until 90 seconds before entry
+        # 90 seconds PRIOR check loop
         while True:
             now_ist = datetime.now(IST)
             seconds_to_entry = (planned_entry_time - now_ist).total_seconds()
             if seconds_to_entry <= 90:
-                log_info(f"90 seconds before entry. Re-verifying signal and qty for {symbol}")
+                log_info(f"90 seconds before entry for {symbol}. Re-verifying signal and qty.")
+                prior_msg = (
+                    f"⏳ <b>90 Seconds Prior Signal Check</b>\n"
+                    f"Symbol: <b>{symbol}</b>\n"
+                    f"Re-checking funding rate, price and eligibility before entry."
+                )
+                send_telegram_to_all(prior_msg)
                 funding = get_funding_data(symbol)
-                rate = funding.get("fundingRate")
-                price = funding.get("price")
-                if rate is None or price is None:
-                    log_error(f"Funding info missing on reverify for {symbol}. Trade canceled.")
-                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Funding info missing on reverify for {symbol}.")
-                    trade_active = False
-                    break
-                qty_new = truncate_qty(price, INITIAL_TRADE_USDT)
+                rate_check = funding.get("fundingRate")
+                price_check = funding.get("price")
+                if rate_check is None or price_check is None:
+                    log_error(f"Funding info missing on reverify for {symbol}. Will try next signal if available.")
+                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Funding info missing on reverify for <b>{symbol}</b>.\nTrying next signal.")
+                    break # check next signal
+                qty_new = truncate_qty(price_check, INITIAL_TRADE_USDT)
                 if qty_new == 0:
-                    log_error(f"Price too high for $50 capital. Trade canceled.")
-                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Price too high for $50 capital.")
-                    trade_active = False
-                    break
-                if rate > FUNDING_RATE_THRESHOLD:
-                    log_info(f"Funding rate is no longer below threshold. Trade canceled.")
-                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Funding rate is no longer below threshold.")
-                    trade_active = False
+                    log_error(f"Price too high for $50 capital. Will try next signal.")
+                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Price too high for $50 capital for <b>{symbol}</b>.\nTrying next signal.")
+                    break # check next signal
+                if rate_check > FUNDING_RATE_THRESHOLD:
+                    log_info(f"Funding rate is no longer below threshold. Will try next signal.")
+                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Funding rate is no longer below threshold for <b>{symbol}</b>.\nTrying next signal.")
                     break
                 qty = qty_new
-                log_info(f"[REVERIFY] Qty: {qty}, Price: {price}, Funding Rate: {rate}")
-                break
-            else:
-                time.sleep(10)
+                price = price_check
+                log_info(f"[REVERIFY PASSED] Qty: {qty}, Price: {price}, Funding Rate: {rate_check:.4f}")
 
-        # Wait for exact entry time
-        while True and trade_active:
-            now_ist = datetime.now(IST)
-            seconds_to_entry = (planned_entry_time - now_ist).total_seconds()
-            if seconds_to_entry <= 0:
-                log_info(f"[ENTRY] Entering trade {symbol} at qty {qty} and price {price}")
-                set_leverage(client, symbol, TRADE_LEVERAGE)
-                tried_qty = qty
-                order = None
-                while tried_qty > 0:
-                    order = place_market_long(client, symbol, tried_qty)
-                    if order:
-                        log_info(f"Trade executed: {order}")
-                        break
+                # Wait for exact entry time
+                while True:
+                    now_ist = datetime.now(IST)
+                    seconds_to_entry = (planned_entry_time - now_ist).total_seconds()
+                    if seconds_to_entry <= 0:
+                        entry_msg = (
+                            f"🚀 <b>Trade Entry</b>\n"
+                            f"Symbol: <b>{symbol}</b>\n"
+                            f"Qty: <b>{qty}</b>\n"
+                            f"Entry Price: <b>{price}</b>\n"
+                            f"Leverage: <b>{TRADE_LEVERAGE}x</b>\n"
+                            f"Entry Time (IST): <b>{format_time(now_ist)}</b>"
+                        )
+                        set_leverage(client, symbol, TRADE_LEVERAGE)
+                        tried_qty = qty
+                        order = None
+                        # Retry logic with 95% qty on failure
+                        while tried_qty > 0:
+                            order = place_market_long(client, symbol, tried_qty)
+                            if order:
+                                log_info(f"Trade executed: {order}")
+                                break
+                            else:
+                                tried_qty = int(tried_qty * 0.95)
+                                log_info(f"[RETRY] Retrying with qty {tried_qty}")
+                        if not order:
+                            log_error(f"Unable to place trade for {symbol}. Will try next signal if available.")
+                            send_telegram_to_all(
+                                f"❌ <b>Trade Canceled</b>\nReason: Unable to place trade for <b>{symbol}</b> even after retries. Trying next signal."
+                            )
+                            break # try next signal
+
+                        actual_entry_price = float(order.get('avgFillPrice', price))
+                        send_telegram_to_all(
+                            entry_msg +
+                            f"\nOrder ID: <b>{order.get('orderId')}</b>\nActual Entry Price: <b>{actual_entry_price}</b>"
+                        )
+                        sl_order = place_stop_loss(client, symbol, actual_entry_price, tried_qty)
+                        if sl_order:
+                            send_telegram_to_all(
+                                f"🛡️ <b>Stop Loss Placed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nSL Price: <b>{round(actual_entry_price * (1 - STOP_LOSS_PCT), 6)}</b>\nOrder ID: <b>{sl_order.get('orderId')}</b>"
+                            )
+                        else:
+                            send_telegram_to_all(
+                                f"⚠️ <b>Stop Loss Failed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>"
+                            )
+                        exit_time = funding_time_ist - timedelta(minutes=1)
+                        seconds_to_exit = (exit_time - now_ist).total_seconds()
+                        log_info(f"[EXIT PLANNED] Will exit at {format_time(exit_time)} (in {format_time_remaining(seconds_to_exit)})")
+                        send_telegram_to_all(
+                            f"⏳ <b>Exit Scheduled</b>\nSymbol: <b>{symbol}</b>\nExit Time: <b>{format_time(exit_time)}</b> (1 min before funding round ends)"
+                        )
+                        time.sleep(max(0, seconds_to_exit))
+
+                        close_order = close_market_long(client, symbol, tried_qty)
+                        now_exit = datetime.now(IST)
+                        if close_order:
+                            log_info(f"Position closed: {close_order}")
+                            send_telegram_to_all(
+                                f"🔒 <b>Trade Closed (Scheduled Exit)</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: <b>{format_time(now_exit)}</b>\nOrder ID: <b>{close_order.get('orderId')}</b>"
+                            )
+                        else:
+                            log_error(f"Failed to close position for {symbol}. Please check manually.")
+                            send_telegram_to_all(
+                                f"❌ <b>Trade Close Failed</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: <b>{format_time(now_exit)}</b>"
+                            )
+                        usdt_balance = get_futures_balance(client)
+                        next_capital = round(usdt_balance * NEXT_TRADE_CAPITAL_PCT, 2)
+                        pnl_msg = (
+                            f"💰 <b>P&L & Balance Report</b>\n"
+                            f"Symbol: <b>{symbol}</b>\n"
+                            f"Qty: <b>{tried_qty}</b>\n"
+                            f"Entry Price: <b>{actual_entry_price}</b>\n"
+                            f"Exit Time: <b>{format_time(now_exit)}</b>\n"
+                            f"Current Futures USDT Balance: <b>{usdt_balance:.2f}</b>\n"
+                            f"Next trade capital: <b>{next_capital:.2f}</b>"
+                        )
+                        send_telegram_to_all(pnl_msg)
+                        log_info(f"[TRADE COMPLETE] {symbol} qty={tried_qty} entry={actual_entry_price} exitTime={format_time(now_exit)}")
+                        return # Only one trade per scan!
                     else:
-                        tried_qty = int(tried_qty * 0.95)
-                        log_info(f"[RETRY] Retrying with qty {tried_qty}")
-                if not order:
-                    log_error(f"Unable to place trade for {symbol}. Trade canceled.")
-                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Unable to place trade for {symbol}.")
-                    trade_active = False
-                    break
-
-                entry_price = float(order.get('avgFillPrice', entry_price))
-                send_telegram_to_all(
-                    f"🚀 <b>Trade Executed</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nEntry Price: {entry_price}\nLeverage: <b>{TRADE_LEVERAGE}x</b>\nTime: {format_time(now_ist)}"
-                )
-                sl_order = place_stop_loss(client, symbol, entry_price, tried_qty)
-                if sl_order:
-                    send_telegram_to_all(
-                        f"🛡️ <b>Stop Loss Placed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nSL Price: <b>{round(entry_price * (1 - STOP_LOSS_PCT), 6)}</b>"
-                    )
-                else:
-                    send_telegram_to_all(
-                        f"⚠️ <b>Stop Loss Failed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>"
-                    )
-                exit_time = funding_end_time - timedelta(minutes=1)
-                seconds_to_exit = (exit_time - now_ist).total_seconds()
-                log_info(f"[EXIT PLANNED] Will exit at {format_time(exit_time)} (in {format_time_remaining(seconds_to_exit)})")
-                time.sleep(max(0, seconds_to_exit))
-
-                close_order = close_market_long(client, symbol, tried_qty)
-                if close_order:
-                    log_info(f"Position closed: {close_order}")
-                    send_telegram_to_all(
-                        f"🔒 <b>Trade Closed (Scheduled Exit)</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: {format_time(datetime.now(IST))}"
-                    )
-                else:
-                    log_error(f"Failed to close position for {symbol}. Please check manually.")
-                    send_telegram_to_all(
-                        f"❌ <b>Trade Close Failed</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: {format_time(datetime.now(IST))}"
-                    )
-                usdt_balance = get_futures_balance(client)
-                next_capital = round(usdt_balance * NEXT_TRADE_CAPITAL_PCT, 2)
-                send_telegram_to_all(
-                    f"💰 <b>P&L Report</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nRemaining USDT: <b>{usdt_balance:.2f}</b>\nNext trade capital: <b>{next_capital:.2f}</b>"
-                )
-                trade_active = False
-                break
+                        time.sleep(10)
             else:
                 time.sleep(10)
-
-    end_time = time.time()
-    duration_str = f"{end_time - start_time:.2f} seconds"
-    log_info(f"Scan finished. Coins scanned: {num_scanned}. Time taken: {duration_str}")
+    send_telegram_to_all("❌ <b>All shortlisted signals failed 90-sec check or execution. No trade taken this scan.</b>")
+    log_info("All shortlisted signals failed. Scan complete.")
 
 def sleep_until_next_half_hour():
     now_ist = datetime.now(IST)
@@ -439,19 +459,28 @@ def sleep_until_next_half_hour():
     time.sleep(max(0, sleep_seconds))
 
 def main():
-    log_info("Starting Funding Rate Bot with Railway public IP and Binance API verification.")
+    log_info("===== Funding Rate Bot Starting =====")
     client = verify_bot_startup()
-    send_telegram_to_all(
+    usdt_balance = get_futures_balance(client)
+    start_msg = (
         f"🚀 <b>FUNDING RATE BOT STARTED</b>\n"
         f"⚙️ Status: <b>Online</b>\n"
         f"📊 Threshold: <b>{FUNDING_RATE_THRESHOLD*100:.2f}%</b>\n"
         f"⚡ Leverage: <b>{TRADE_LEVERAGE}x</b>\n"
-        f"🕐 Time: <b>{format_time(datetime.now(IST))} IST</b>"
+        f"💰 Initial USDT Balance: <b>{usdt_balance:.2f}</b>\n"
+        f"🕐 Start Time: <b>{format_time(datetime.now(IST))} IST</b>\n"
+        f"📡 Scans: Immediate first, then every next HH:30 (e.g. 10:30, 11:30 ...)"
     )
+    send_telegram_to_all(start_msg)
+    log_info(start_msg.replace('\n', ' '))
+    first_scan = True
     while True:
         try:
             scan_opportunities(client)
-            sleep_until_next_half_hour()
+            if first_scan:
+                first_scan = False
+            else:
+                sleep_until_next_half_hour()
         except Exception as e:
             log_error(f"Critical error in main loop: {e}")
             send_telegram_to_all(
