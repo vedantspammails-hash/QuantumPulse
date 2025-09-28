@@ -14,51 +14,17 @@ from binance.exceptions import BinanceAPIException
 # --- Load environment variables ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Support multiple chat IDs (comma or space separated)
 TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_ID", "").replace(',', ' ').split()
 BINANCE_API_KEY = os.getenv("API_KEY")
 BINANCE_API_SECRET = os.getenv("API_SECRET")
 IST = pytz.timezone("Asia/Kolkata")
 
-# Whitelisted IPs (comma or space separated, set in your .env file)
-WHITELISTED_IPS = os.getenv("WHITELISTED_IPS", "").replace(',', ' ').split()
-
 # FUNDING RATE THRESHOLD (-0.5% as decimal); change here for future updates
 FUNDING_RATE_THRESHOLD = -0.005
-# INITIAL CAPITAL IN USDT
 INITIAL_TRADE_USDT = 50
-# NEXT TRADE CAPITAL % of available USDT after closing previous trade
 NEXT_TRADE_CAPITAL_PCT = 0.99
-# LEVERAGE
 TRADE_LEVERAGE = 1
-# STOP LOSS percent below entry
 STOP_LOSS_PCT = 0.10
-
-client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=False)
-
-def get_public_ip():
-    try:
-        response = requests.get("https://api.ipify.org?format=json", timeout=10)
-        response.raise_for_status()
-        ip = response.json().get("ip")
-        return ip
-    except Exception as e:
-        log_error(f"Failed to fetch public IP: {e}")
-        return None
-
-def verify_ip_whitelist():
-    ip = get_public_ip()
-    log_info(f"Detected Public IP: {ip}")
-    if not ip:
-        log_error("Could not determine public IP for whitelist verification.")
-        send_telegram_to_all("❌ <b>Bot Startup Failed</b>\nReason: Public IP could not be determined.\nCheck network connection.")
-        exit(1)
-    if WHITELISTED_IPS and ip not in WHITELISTED_IPS:
-        log_error(f"Public IP {ip} is NOT in whitelist: {WHITELISTED_IPS}")
-        send_telegram_to_all(f"❌ <b>Bot Startup Failed</b>\nReason: Public IP <b>{ip}</b> not whitelisted.\nAllowed IPs: <b>{', '.join(WHITELISTED_IPS)}</b>")
-        exit(1)
-    log_info("Public IP is whitelisted. Bot will continue.")
-    send_telegram_to_all(f"✅ <b>IP Whitelist Check Passed</b>\nPublic IP: <b>{ip}</b>\nAllowed IPs: <b>{', '.join(WHITELISTED_IPS)}</b>")
 
 def log_info(msg):
     timestamp = datetime.now(IST).strftime("[%Y-%m-%d %H:%M:%S IST]")
@@ -79,6 +45,65 @@ async def send_telegram_message(message):
 
 def send_telegram_to_all(message):
     asyncio.run(send_telegram_message(message))
+
+def get_public_ip():
+    try:
+        response = requests.get("https://api.ipify.org?format=json", timeout=10)
+        response.raise_for_status()
+        ip = response.json().get("ip")
+        log_info(f"Detected Public IP: {ip}")
+        send_telegram_to_all(
+            f"🔔 <b>Railway Public IP</b>\nDetected IP: <b>{ip}</b>\n"
+            "If you see API whitelist errors, please add this IP to Binance API key whitelist and restart the bot."
+        )
+        return ip
+    except Exception as e:
+        log_error(f"Failed to fetch public IP: {e}")
+        send_telegram_to_all(f"❌ <b>Error fetching public IP</b>\nError: {e}")
+        return None
+
+def verify_binance_api():
+    # Try connecting and getting account info
+    try:
+        client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=False)
+        log_info("Binance client initialized.")
+        # Check account status, permissions
+        acc_status = client.futures_account()
+        log_info(f"Binance futures account loaded: {acc_status['canTrade']}, {acc_status['updateTime']}")
+        send_telegram_to_all(
+            f"✅ <b>Binance API Verified</b>\nFutures trading enabled: <b>{acc_status['canTrade']}</b>\nUpdateTime: <b>{acc_status['updateTime']}</b>"
+        )
+        return client
+    except BinanceAPIException as e:
+        log_error(f"BinanceAPIException: {e}")
+        send_telegram_to_all(
+            f"❌ <b>Binance API Error</b>\nError: <b>{e.message}</b>\n"
+            "Check API key, secret, permissions, and IP whitelist."
+        )
+        return None
+    except Exception as e:
+        log_error(f"General Binance error: {e}")
+        send_telegram_to_all(
+            f"❌ <b>Binance General Error</b>\nError: <b>{e}</b>\n"
+            "Check API key, secret, permissions, and IP whitelist."
+        )
+        return None
+
+def verify_bot_startup():
+    log_info("Bot startup verification initiated.")
+    send_telegram_to_all("🚦 <b>Bot Startup</b>\nVerifying Railway IP and Binance API status...")
+    ip = get_public_ip()
+    if not ip:
+        log_error("Aborting: Could not get public IP for whitelisting.")
+        exit(1)
+    client = verify_binance_api()
+    if not client:
+        log_error("Aborting: Binance API verification failed.")
+        exit(1)
+    log_info("All startup checks passed.")
+    send_telegram_to_all("✅ <b>Bot Startup Verification Passed</b>\nBot is online and ready.")
+
+    return client
 
 def format_time(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -132,7 +157,7 @@ def get_funding_data(symbol):
             "error": str(e),
         }
 
-def get_futures_balance():
+def get_futures_balance(client):
     try:
         balance = client.futures_account_balance()
         usdt_balances = [float(b['balance']) for b in balance if b['asset'] == 'USDT']
@@ -143,14 +168,14 @@ def get_futures_balance():
         log_error(f"Cannot fetch futures balance: {e}")
         return 0.0
 
-def set_leverage(symbol, leverage):
+def set_leverage(client, symbol, leverage):
     try:
         client.futures_change_leverage(symbol=symbol, leverage=leverage)
         log_info(f"Set leverage {leverage}x for {symbol}")
     except BinanceAPIException as e:
         log_error(f"Could not set leverage: {e}")
 
-def place_market_long(symbol, qty):
+def place_market_long(client, symbol, qty):
     log_info(f"Attempting market BUY for {symbol} qty: {qty}")
     try:
         order = client.futures_create_order(
@@ -165,7 +190,7 @@ def place_market_long(symbol, qty):
         log_error(f"Order error: {e}")
         return None
 
-def place_stop_loss(symbol, entry_price, qty):
+def place_stop_loss(client, symbol, entry_price, qty):
     stop_price = round(entry_price * (1 - STOP_LOSS_PCT), 6)
     log_info(f"Placing stop loss at {stop_price} ({STOP_LOSS_PCT*100}% below entry price)")
     try:
@@ -183,7 +208,7 @@ def place_stop_loss(symbol, entry_price, qty):
         log_error(f"Failed to place stop loss: {e}")
         return None
 
-def close_market_long(symbol, qty):
+def close_market_long(client, symbol, qty):
     log_info(f"Attempting market SELL (close) for {symbol} qty: {qty}")
     try:
         order = client.futures_create_order(
@@ -207,14 +232,13 @@ def truncate_qty(price, capital):
     log_info(f"Calculated qty: {qty} for capital: {capital} and price: {price}")
     return qty if qty > 0 else 0
 
-def scan_opportunities():
+def scan_opportunities(client):
     log_info("Scanning funding rate opportunities on Binance USDT-margined perpetual futures...")
     start_time = time.time()
     symbols = get_binance_usdt_perpetual_symbols()
     num_scanned = len(symbols)
     log_info(f"Total pairs scanned: {num_scanned}")
 
-    # Trade state
     trade_active = False
     current_trade = {}
     trade_planned = False
@@ -289,7 +313,6 @@ def scan_opportunities():
             }
             break
 
-    # Send notification if no trade planned in this scan
     if not trade_planned:
         end_time = time.time()
         duration_str = f"{end_time - start_time:.2f} seconds"
@@ -346,11 +369,11 @@ def scan_opportunities():
             seconds_to_entry = (planned_entry_time - now_ist).total_seconds()
             if seconds_to_entry <= 0:
                 log_info(f"[ENTRY] Entering trade {symbol} at qty {qty} and price {price}")
-                set_leverage(symbol, TRADE_LEVERAGE)
+                set_leverage(client, symbol, TRADE_LEVERAGE)
                 tried_qty = qty
                 order = None
                 while tried_qty > 0:
-                    order = place_market_long(symbol, tried_qty)
+                    order = place_market_long(client, symbol, tried_qty)
                     if order:
                         log_info(f"Trade executed: {order}")
                         break
@@ -363,13 +386,11 @@ def scan_opportunities():
                     trade_active = False
                     break
 
-                # Get entry price from order fill (if available)
-                entry_price = float(order['avgFillPrice']) if 'avgFillPrice' in order and order['avgFillPrice'] else price
+                entry_price = float(order.get('avgFillPrice', entry_price))
                 send_telegram_to_all(
                     f"🚀 <b>Trade Executed</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nEntry Price: {entry_price}\nLeverage: <b>{TRADE_LEVERAGE}x</b>\nTime: {format_time(now_ist)}"
                 )
-                # Place SL
-                sl_order = place_stop_loss(symbol, entry_price, tried_qty)
+                sl_order = place_stop_loss(client, symbol, entry_price, tried_qty)
                 if sl_order:
                     send_telegram_to_all(
                         f"🛡️ <b>Stop Loss Placed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nSL Price: <b>{round(entry_price * (1 - STOP_LOSS_PCT), 6)}</b>"
@@ -378,14 +399,12 @@ def scan_opportunities():
                     send_telegram_to_all(
                         f"⚠️ <b>Stop Loss Failed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>"
                     )
-                # Schedule exit
                 exit_time = funding_end_time - timedelta(minutes=1)
                 seconds_to_exit = (exit_time - now_ist).total_seconds()
                 log_info(f"[EXIT PLANNED] Will exit at {format_time(exit_time)} (in {format_time_remaining(seconds_to_exit)})")
                 time.sleep(max(0, seconds_to_exit))
 
-                # Close position (if still open: i.e. if SL not hit)
-                close_order = close_market_long(symbol, tried_qty)
+                close_order = close_market_long(client, symbol, tried_qty)
                 if close_order:
                     log_info(f"Position closed: {close_order}")
                     send_telegram_to_all(
@@ -396,8 +415,7 @@ def scan_opportunities():
                     send_telegram_to_all(
                         f"❌ <b>Trade Close Failed</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: {format_time(datetime.now(IST))}"
                     )
-                # Report balance, next capital
-                usdt_balance = get_futures_balance()
+                usdt_balance = get_futures_balance(client)
                 next_capital = round(usdt_balance * NEXT_TRADE_CAPITAL_PCT, 2)
                 send_telegram_to_all(
                     f"💰 <b>P&L Report</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nRemaining USDT: <b>{usdt_balance:.2f}</b>\nNext trade capital: <b>{next_capital:.2f}</b>"
@@ -421,8 +439,8 @@ def sleep_until_next_half_hour():
     time.sleep(max(0, sleep_seconds))
 
 def main():
-    log_info("Starting Funding Rate Bot with IP whitelist verification.")
-    verify_ip_whitelist()
+    log_info("Starting Funding Rate Bot with Railway public IP and Binance API verification.")
+    client = verify_bot_startup()
     send_telegram_to_all(
         f"🚀 <b>FUNDING RATE BOT STARTED</b>\n"
         f"⚙️ Status: <b>Online</b>\n"
@@ -432,7 +450,7 @@ def main():
     )
     while True:
         try:
-            scan_opportunities()
+            scan_opportunities(client)
             sleep_until_next_half_hour()
         except Exception as e:
             log_error(f"Critical error in main loop: {e}")
