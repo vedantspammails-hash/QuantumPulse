@@ -494,18 +494,10 @@ def main():
     log_info(start_msg.replace('\n', ' '))
     first_scan = True
     while True:
-        try:
-            scan_opportunities(client)
-            if first_scan:
-                first_scan = False
-            else:
-                sleep_until_next_half_hour()
-        except Exception as e:
-            log_error(f"Critical error in main loop: {e}")
-            send_telegram_to_all(
-                f"🚨 <b>CRITICAL ERROR</b>\n🚫 Error: <b>{str(e)}</b>\n🔄 Action: <b>Restarting in 1 minute</b>\n🕐 Time: <b>{format_time(datetime.now(IST))} IST</b>"
-            )
-            time.sleep(60)
+        if not first_scan:
+            sleep_until_next_half_hour()
+        scan_opportunities(client)
+        first_scan = False
 
 if __name__ == "__main__":
     main()
