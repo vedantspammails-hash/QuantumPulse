@@ -218,6 +218,23 @@ def place_stop_loss(client, symbol, entry_price, qty):
         log_error(f"Failed to place stop loss: {e}")
         return None
 
+def cancel_open_stop_orders(client, symbol):
+    cancelled_any = False
+    try:
+        open_orders = client.futures_get_open_orders(symbol=symbol)
+        for order in open_orders:
+            if order['type'] == "STOP_MARKET":
+                client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
+                log_info(f"Cancelled STOP_MARKET order {order['orderId']} for {symbol}")
+                send_telegram_to_all(f"✅ Cancelled STOP_MARKET order <b>{order['orderId']}</b> for <b>{symbol}</b> after scheduled exit.")
+                cancelled_any = True
+        if not cancelled_any:
+            log_info(f"No STOP_MARKET orders to cancel for {symbol}")
+            send_telegram_to_all(f"ℹ️ No STOP_MARKET orders to cancel for <b>{symbol}</b> after scheduled exit.")
+    except Exception as e:
+        log_error(f"Failed to cancel open stop orders for {symbol}: {e}")
+        send_telegram_to_all(f"❌ Error cancelling STOP_MARKET orders for <b>{symbol}</b> after scheduled exit.\nError: <b>{e}</b>")
+
 def close_market_long(client, symbol, qty):
     log_info(f"Attempting market SELL (close) for {symbol} qty: {qty}")
     try:
@@ -445,6 +462,10 @@ def scan_opportunities(client):
                             send_telegram_to_all(
                                 f"❌ <b>Trade Close Failed</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: <b>{format_time(now_exit)}</b>\nFunding Rate at Exit: <b>{exit_funding_rate_str}</b>"
                             )
+
+                        # Cancel any open stop loss orders for this symbol
+                        cancel_open_stop_orders(client, symbol)
+
                         usdt_balance = get_futures_balance(client)
                         next_capital = round(usdt_balance * NEXT_TRADE_CAPITAL_PCT, 2)
                         pnl_msg = (
