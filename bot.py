@@ -8,7 +8,7 @@ import telegram
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from binance.client import Client
-from binance.enums import ORDER_TYPE_MARKET, ORDER_TYPE_STOP_MARKET, SIDE_BUY, SIDE_SELL
+from binance.enums import ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
 from binance.exceptions import BinanceAPIException
 
 # --- Load environment variables ---
@@ -189,10 +189,8 @@ def place_market_long(client, symbol, qty):
         return None
 
 def get_actual_entry_price(client, symbol, order, qty):
-    # Try avgFillPrice if present
     if 'avgFillPrice' in order and float(order['avgFillPrice']) > 0:
         return float(order['avgFillPrice'])
-    # Fallback: fetch account trades for this symbol and get the most recent BUY fill for the qty
     try:
         trades = client.futures_account_trades(symbol=symbol)
         for trade in reversed(trades):
@@ -209,7 +207,7 @@ def place_stop_loss(client, symbol, entry_price, qty):
         order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
-            type=ORDER_TYPE_STOP_MARKET,
+            type="STOP_MARKET",  # Use string for compatibility
             stopPrice=stop_price,
             quantity=qty,
             reduceOnly=True
@@ -278,7 +276,6 @@ def scan_opportunities(client):
     scan_duration = end_scan_time - start_time
     log_info(f"Funding fetch for all {num_scanned} symbols complete. Scan duration: {scan_duration:.2f}s")
 
-    # Shortlist signals according to your rules:
     shortlisted_signals = []
     for funding in funding_results:
         symbol = funding["symbol"]
@@ -292,7 +289,6 @@ def scan_opportunities(client):
         funding_time_ist = funding_time_utc.astimezone(IST)
         now_ist = datetime.now(IST)
         time_to_funding = (funding_time_ist - now_ist).total_seconds() - scan_duration
-        # Only shortlist signals that pass both conditions
         if rate < FUNDING_RATE_THRESHOLD and 0 < time_to_funding < 3600:
             shortlisted_signals.append({
                 "symbol": symbol,
@@ -317,7 +313,6 @@ def scan_opportunities(client):
         log_info("No shortlisted signals. Scan complete.")
         return
 
-    # Try signals one by one, only one trade at a time
     for idx, signal in enumerate(shortlisted_signals):
         symbol = signal['symbol']
         rate = signal['fundingRate']
@@ -344,7 +339,6 @@ def scan_opportunities(client):
         send_telegram_to_all(plan_msg)
         log_info(plan_msg.replace('\n', ' '))
 
-        # 90 seconds PRIOR check loop
         while True:
             now_ist = datetime.now(IST)
             seconds_to_entry = (planned_entry_time - now_ist).total_seconds()
@@ -362,12 +356,12 @@ def scan_opportunities(client):
                 if rate_check is None or price_check is None:
                     log_error(f"Funding info missing on reverify for {symbol}. Will try next signal if available.")
                     send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Funding info missing on reverify for <b>{symbol}</b>.\nTrying next signal.")
-                    break # check next signal
+                    break
                 qty_new = truncate_qty(price_check, INITIAL_TRADE_USDT)
                 if qty_new == 0:
                     log_error(f"Price too high for $50 capital. Will try next signal.")
                     send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Price too high for $50 capital for <b>{symbol}</b>.\nTrying next signal.")
-                    break # check next signal
+                    break
                 if rate_check > FUNDING_RATE_THRESHOLD:
                     log_info(f"Funding rate is no longer below threshold. Will try next signal.")
                     send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Funding rate is no longer below threshold for <b>{symbol}</b>.\nTrying next signal.")
@@ -376,7 +370,6 @@ def scan_opportunities(client):
                 price = price_check
                 log_info(f"[REVERIFY PASSED] Qty: {qty}, Price: {price}, Funding Rate: {rate_check:.4f}")
 
-                # Wait for exact entry time
                 while True:
                     now_ist = datetime.now(IST)
                     seconds_to_entry = (planned_entry_time - now_ist).total_seconds()
@@ -384,7 +377,6 @@ def scan_opportunities(client):
                         set_leverage(client, symbol, TRADE_LEVERAGE)
                         tried_qty = qty
                         order = None
-                        # Retry logic with 95% qty on failure
                         while tried_qty > 0:
                             order = place_market_long(client, symbol, tried_qty)
                             if order:
@@ -398,15 +390,13 @@ def scan_opportunities(client):
                             send_telegram_to_all(
                                 f"❌ <b>Trade Canceled</b>\nReason: Unable to place trade for <b>{symbol}</b> even after retries. Trying next signal."
                             )
-                            break # try next signal
+                            break
 
-                        # Get the **actual** entry price (fill price)
                         actual_entry_price = get_actual_entry_price(client, symbol, order, tried_qty)
                         if actual_entry_price is None:
-                            actual_entry_price = price # fallback, but you should see a log error if not filled
+                            actual_entry_price = price
                             log_error(f"Could not determine actual fill price for {symbol}, reporting mark price.")
 
-                        # Get funding rate at entry
                         entry_funding_data = get_funding_data(symbol)
                         entry_funding_rate = entry_funding_data['fundingRate'] if entry_funding_data else None
                         entry_funding_rate_str = f"{entry_funding_rate:.4f}" if entry_funding_rate is not None else "N/A"
@@ -439,7 +429,6 @@ def scan_opportunities(client):
                         )
                         time.sleep(max(0, seconds_to_exit))
 
-                        # Get funding rate at exit
                         exit_funding_data = get_funding_data(symbol)
                         exit_funding_rate = exit_funding_data['fundingRate'] if exit_funding_data else None
                         exit_funding_rate_str = f"{exit_funding_rate:.4f}" if exit_funding_rate is not None else "N/A"
@@ -471,7 +460,7 @@ def scan_opportunities(client):
                         )
                         send_telegram_to_all(pnl_msg)
                         log_info(f"[TRADE COMPLETE] {symbol} qty={tried_qty} entry={actual_entry_price} exitTime={format_time(now_exit)}")
-                        return # Only one trade per scan!
+                        return
                     else:
                         time.sleep(10)
             else:
