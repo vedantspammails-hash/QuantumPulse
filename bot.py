@@ -8,7 +8,7 @@ import telegram
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from binance.client import Client
-from binance.enums import *
+from binance.enums import ORDER_TYPE_MARKET, ORDER_TYPE_STOP_MARKET, SIDE_BUY, SIDE_SELL
 from binance.exceptions import BinanceAPIException
 
 # --- Load environment variables ---
@@ -182,11 +182,25 @@ def place_market_long(client, symbol, qty):
             type=ORDER_TYPE_MARKET,
             quantity=qty
         )
-        log_info(f"Market BUY successful for {symbol}, qty: {qty}")
+        log_info(f"Market BUY successful for {symbol}, qty: {qty}, order: {order}")
         return order
     except BinanceAPIException as e:
         log_error(f"Order error: {e}")
         return None
+
+def get_actual_entry_price(client, symbol, order, qty):
+    # Try avgFillPrice if present
+    if 'avgFillPrice' in order and float(order['avgFillPrice']) > 0:
+        return float(order['avgFillPrice'])
+    # Fallback: fetch account trades for this symbol and get the most recent BUY fill for the qty
+    try:
+        trades = client.futures_account_trades(symbol=symbol)
+        for trade in reversed(trades):
+            if trade['side'] == 'BUY' and abs(float(trade['qty']) - qty) < 1e-6:
+                return float(trade['price'])
+    except Exception as e:
+        log_error(f"Could not fetch fills for {symbol}: {e}")
+    return None
 
 def place_stop_loss(client, symbol, entry_price, qty):
     stop_price = round(entry_price * (1 - STOP_LOSS_PCT), 6)
@@ -200,7 +214,7 @@ def place_stop_loss(client, symbol, entry_price, qty):
             quantity=qty,
             reduceOnly=True
         )
-        log_info(f"Stop loss order placed at {stop_price}")
+        log_info(f"Stop loss order placed at {stop_price}, order: {order}")
         return order
     except BinanceAPIException as e:
         log_error(f"Failed to place stop loss: {e}")
@@ -216,7 +230,7 @@ def close_market_long(client, symbol, qty):
             quantity=qty,
             reduceOnly=True
         )
-        log_info(f"Market SELL successful for {symbol}, qty: {qty}")
+        log_info(f"Market SELL successful for {symbol}, qty: {qty}, order: {order}")
         return order
     except BinanceAPIException as e:
         log_error(f"Order error: {e}")
@@ -367,14 +381,6 @@ def scan_opportunities(client):
                     now_ist = datetime.now(IST)
                     seconds_to_entry = (planned_entry_time - now_ist).total_seconds()
                     if seconds_to_entry <= 0:
-                        entry_msg = (
-                            f"🚀 <b>Trade Entry</b>\n"
-                            f"Symbol: <b>{symbol}</b>\n"
-                            f"Qty: <b>{qty}</b>\n"
-                            f"Entry Price: <b>{price}</b>\n"
-                            f"Leverage: <b>{TRADE_LEVERAGE}x</b>\n"
-                            f"Entry Time (IST): <b>{format_time(now_ist)}</b>"
-                        )
                         set_leverage(client, symbol, TRADE_LEVERAGE)
                         tried_qty = qty
                         order = None
@@ -394,11 +400,28 @@ def scan_opportunities(client):
                             )
                             break # try next signal
 
-                        actual_entry_price = float(order.get('avgFillPrice', price))
+                        # Get the **actual** entry price (fill price)
+                        actual_entry_price = get_actual_entry_price(client, symbol, order, tried_qty)
+                        if actual_entry_price is None:
+                            actual_entry_price = price # fallback, but you should see a log error if not filled
+                            log_error(f"Could not determine actual fill price for {symbol}, reporting mark price.")
+
+                        # Get funding rate at entry
+                        entry_funding_data = get_funding_data(symbol)
+                        entry_funding_rate = entry_funding_data['fundingRate'] if entry_funding_data else None
+                        entry_funding_rate_str = f"{entry_funding_rate:.4f}" if entry_funding_rate is not None else "N/A"
                         send_telegram_to_all(
-                            entry_msg +
-                            f"\nOrder ID: <b>{order.get('orderId')}</b>\nActual Entry Price: <b>{actual_entry_price}</b>"
+                            f"🚀 <b>Trade Entry</b>\n"
+                            f"Symbol: <b>{symbol}</b>\n"
+                            f"Qty: <b>{tried_qty}</b>\n"
+                            f"Entry Price (Mark): <b>{price}</b>\n"
+                            f"Actual Entry Price (fill): <b>{actual_entry_price}</b>\n"
+                            f"Funding Rate at Entry: <b>{entry_funding_rate_str}</b>\n"
+                            f"Leverage: <b>{TRADE_LEVERAGE}x</b>\n"
+                            f"Order ID: <b>{order.get('orderId')}</b>\n"
+                            f"Entry Time (IST): <b>{format_time(now_ist)}</b>"
                         )
+
                         sl_order = place_stop_loss(client, symbol, actual_entry_price, tried_qty)
                         if sl_order:
                             send_telegram_to_all(
@@ -416,17 +439,22 @@ def scan_opportunities(client):
                         )
                         time.sleep(max(0, seconds_to_exit))
 
+                        # Get funding rate at exit
+                        exit_funding_data = get_funding_data(symbol)
+                        exit_funding_rate = exit_funding_data['fundingRate'] if exit_funding_data else None
+                        exit_funding_rate_str = f"{exit_funding_rate:.4f}" if exit_funding_rate is not None else "N/A"
+
                         close_order = close_market_long(client, symbol, tried_qty)
                         now_exit = datetime.now(IST)
                         if close_order:
                             log_info(f"Position closed: {close_order}")
                             send_telegram_to_all(
-                                f"🔒 <b>Trade Closed (Scheduled Exit)</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: <b>{format_time(now_exit)}</b>\nOrder ID: <b>{close_order.get('orderId')}</b>"
+                                f"🔒 <b>Trade Closed (Scheduled Exit)</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: <b>{format_time(now_exit)}</b>\nOrder ID: <b>{close_order.get('orderId')}</b>\nFunding Rate at Exit: <b>{exit_funding_rate_str}</b>"
                             )
                         else:
                             log_error(f"Failed to close position for {symbol}. Please check manually.")
                             send_telegram_to_all(
-                                f"❌ <b>Trade Close Failed</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: <b>{format_time(now_exit)}</b>"
+                                f"❌ <b>Trade Close Failed</b>\nCoin: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nExit Time: <b>{format_time(now_exit)}</b>\nFunding Rate at Exit: <b>{exit_funding_rate_str}</b>"
                             )
                         usdt_balance = get_futures_balance(client)
                         next_capital = round(usdt_balance * NEXT_TRADE_CAPITAL_PCT, 2)
@@ -436,6 +464,8 @@ def scan_opportunities(client):
                             f"Qty: <b>{tried_qty}</b>\n"
                             f"Entry Price: <b>{actual_entry_price}</b>\n"
                             f"Exit Time: <b>{format_time(now_exit)}</b>\n"
+                            f"Funding Rate at Entry: <b>{entry_funding_rate_str}</b>\n"
+                            f"Funding Rate at Exit: <b>{exit_funding_rate_str}</b>\n"
                             f"Current Futures USDT Balance: <b>{usdt_balance:.2f}</b>\n"
                             f"Next trade capital: <b>{next_capital:.2f}</b>"
                         )
