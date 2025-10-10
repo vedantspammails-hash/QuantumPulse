@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from binance.client import Client
 from binance.enums import ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
 from binance.exceptions import BinanceAPIException
+import math
 
 # --- Load environment variables ---
 load_dotenv()
@@ -24,6 +25,8 @@ INITIAL_TRADE_USDT = 50
 NEXT_TRADE_CAPITAL_PCT = 0.99
 TRADE_LEVERAGE = 1
 STOP_LOSS_PCT = 0.10
+
+trade_count = 0  # Global variable to track number of trades executed
 
 def log_info(msg):
     timestamp = datetime.now(IST).strftime("[%Y-%m-%d %H:%M:%S IST]")
@@ -200,9 +203,41 @@ def get_actual_entry_price(client, symbol, order, qty):
         log_error(f"Could not fetch fills for {symbol}: {e}")
     return None
 
+# New helper functions to handle quantity and price precisions:
+
+def get_quantity_precision(client, symbol):
+    try:
+        exchange_info = client.futures_exchange_info()
+        for s in exchange_info['symbols']:
+            if s['symbol'] == symbol:
+                for f in s['filters']:
+                    if f['filterType'] == 'LOT_SIZE':
+                        step_size = float(f['stepSize'])
+                        return int(round(-math.log10(step_size), 0))
+    except Exception as e:
+        log_error(f"Error fetching quantity precision for {symbol}: {e}")
+    return 3  # Default precision if error
+
+def floor_to_precision(value, precision):
+    factor = 10 ** precision
+    return math.floor(value * factor) / factor
+
+def truncate_qty(client, symbol, price, capital):
+    if price <= 0:
+        log_error(f"Price <= 0 for qty calc, returning 0")
+        return 0
+    precision = get_quantity_precision(client, symbol)
+    raw_qty = capital / price
+    qty = floor_to_precision(raw_qty, precision)
+    log_info(f"Calculated qty: {qty} (precision {precision}) for capital: {capital} and price: {price}")
+    return qty if qty > 0 else 0
+
 def place_stop_loss(client, symbol, entry_price, qty):
+    precision = get_quantity_precision(client, symbol)
     stop_price = round(entry_price * (1 - STOP_LOSS_PCT), 6)
-    log_info(f"Placing stop loss at {stop_price} ({STOP_LOSS_PCT*100}% below entry price)")
+    stop_price = floor_to_precision(stop_price, 6)
+    qty = floor_to_precision(qty, precision)
+    log_info(f"Placing stop loss at {stop_price} ({STOP_LOSS_PCT*100}% below entry price), qty: {qty}")
     try:
         order = client.futures_create_order(
             symbol=symbol,
@@ -251,15 +286,9 @@ def close_market_long(client, symbol, qty):
         log_error(f"Order error: {e}")
         return None
 
-def truncate_qty(price, capital):
-    if price <= 0:
-        log_error(f"Price <= 0 for qty calc, returning 0")
-        return 0
-    qty = int(capital / price)
-    log_info(f"Calculated qty: {qty} for capital: {capital} and price: {price}")
-    return qty if qty > 0 else 0
-
 def scan_opportunities(client):
+    global trade_count
+
     log_info("=== [SCAN STARTED] Scanning funding rate opportunities on Binance USDT-margined perpetual futures ===")
     start_time = time.time()
     symbols = get_binance_usdt_perpetual_symbols()
@@ -339,16 +368,27 @@ def scan_opportunities(client):
 
         planned_entry_time = funding_time_ist - timedelta(minutes=50)
         time_to_entry = (planned_entry_time - datetime.now(IST)).total_seconds()
-        qty = truncate_qty(price, INITIAL_TRADE_USDT)
+
+        # Determine capital to use
+        if trade_count == 0:
+            capital_to_use = INITIAL_TRADE_USDT
+        else:
+            usdt_balance = get_futures_balance(client)
+            capital_to_use = usdt_balance * NEXT_TRADE_CAPITAL_PCT
+        
+        qty = truncate_qty(client, symbol, price, capital_to_use)
+
         if qty == 0 or time_to_entry < 0:
             log_info(f"Skipped {symbol}: qty=0 or entry time passed.")
             continue
+
         plan_msg = (
             f"🗂️ <b>Trade Plan #{idx+1}</b>\n"
             f"Symbol: <b>{symbol}</b>\n"
             f"Price: <b>{price}</b>\n"
             f"Funding Rate: <b>{rate:.4f}</b>\n"
             f"Qty: <b>{qty}</b>\n"
+            f"Capital Used: <b>{capital_to_use:.2f} USDT</b>\n"
             f"Planned Entry (IST): <b>{format_time(planned_entry_time)}</b>\n"
             f"Funding Round Ends (IST): <b>{format_time(funding_time_ist)}</b>\n"
             f"Funding Time Left: <b>{format_time_remaining(time_to_funding)}</b>"
@@ -374,10 +414,15 @@ def scan_opportunities(client):
                     log_error(f"Funding info missing on reverify for {symbol}. Will try next signal if available.")
                     send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Funding info missing on reverify for <b>{symbol}</b>.\nTrying next signal.")
                     break
-                qty_new = truncate_qty(price_check, INITIAL_TRADE_USDT)
+                if trade_count == 0:
+                    capital_to_use = INITIAL_TRADE_USDT
+                else:
+                    usdt_balance = get_futures_balance(client)
+                    capital_to_use = usdt_balance * NEXT_TRADE_CAPITAL_PCT
+                qty_new = truncate_qty(client, symbol, price_check, capital_to_use)
                 if qty_new == 0:
-                    log_error(f"Price too high for $50 capital. Will try next signal.")
-                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Price too high for $50 capital for <b>{symbol}</b>.\nTrying next signal.")
+                    log_error(f"Price too high for capital. Will try next signal.")
+                    send_telegram_to_all(f"❌ <b>Trade Canceled</b>\nReason: Price too high for capital for <b>{symbol}</b>.\nTrying next signal.")
                     break
                 if rate_check > FUNDING_RATE_THRESHOLD:
                     log_info(f"Funding rate is no longer below threshold. Will try next signal.")
@@ -400,7 +445,9 @@ def scan_opportunities(client):
                                 log_info(f"Trade executed: {order}")
                                 break
                             else:
-                                tried_qty = int(tried_qty * 0.95)
+                                tried_qty = floor_to_precision(tried_qty * 0.95, get_quantity_precision(client, symbol))
+                                if tried_qty <= 0:
+                                    break
                                 log_info(f"[RETRY] Retrying with qty {tried_qty}")
                         if not order:
                             log_error(f"Unable to place trade for {symbol}. Will try next signal if available.")
@@ -467,6 +514,7 @@ def scan_opportunities(client):
                         cancel_open_stop_orders(client, symbol)
 
                         usdt_balance = get_futures_balance(client)
+                        trade_count += 1  # Increment trade count after a successful trade
                         next_capital = round(usdt_balance * NEXT_TRADE_CAPITAL_PCT, 2)
                         pnl_msg = (
                             f"💰 <b>P&L & Balance Report</b>\n"
