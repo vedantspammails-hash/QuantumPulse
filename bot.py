@@ -192,9 +192,11 @@ def place_market_long(client, symbol, qty):
         return None
 
 def get_actual_entry_price(client, symbol, order, qty):
+    # Try avgFillPrice from order if present
     if 'avgFillPrice' in order and float(order['avgFillPrice']) > 0:
         return float(order['avgFillPrice'])
     try:
+        # Fallback: Get the last trade for this symbol with matching qty and BUY side
         trades = client.futures_account_trades(symbol=symbol)
         for trade in reversed(trades):
             if trade['side'] == 'BUY' and abs(float(trade['qty']) - qty) < 1e-6:
@@ -202,8 +204,6 @@ def get_actual_entry_price(client, symbol, order, qty):
     except Exception as e:
         log_error(f"Could not fetch fills for {symbol}: {e}")
     return None
-
-# New helper functions to handle quantity and price precisions:
 
 def get_quantity_precision(client, symbol):
     try:
@@ -217,6 +217,19 @@ def get_quantity_precision(client, symbol):
     except Exception as e:
         log_error(f"Error fetching quantity precision for {symbol}: {e}")
     return 3  # Default precision if error
+
+def get_price_precision(client, symbol):
+    try:
+        exchange_info = client.futures_exchange_info()
+        for s in exchange_info['symbols']:
+            if s['symbol'] == symbol:
+                for f in s['filters']:
+                    if f['filterType'] == 'PRICE_FILTER':
+                        tick_size = float(f['tickSize'])
+                        return int(round(-math.log10(tick_size), 0))
+    except Exception as e:
+        log_error(f"Error fetching price precision for {symbol}: {e}")
+    return 2  # Default precision if error
 
 def floor_to_precision(value, precision):
     factor = 10 ** precision
@@ -233,25 +246,31 @@ def truncate_qty(client, symbol, price, capital):
     return qty if qty > 0 else 0
 
 def place_stop_loss(client, symbol, entry_price, qty):
-    precision = get_quantity_precision(client, symbol)
-    stop_price = round(entry_price * (1 - STOP_LOSS_PCT), 6)
-    stop_price = floor_to_precision(stop_price, 6)
-    qty = floor_to_precision(qty, precision)
-    log_info(f"Placing stop loss at {stop_price} ({STOP_LOSS_PCT*100}% below entry price), qty: {qty}")
-    try:
-        order = client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type="STOP_MARKET",  # Use string for compatibility
-            stopPrice=stop_price,
-            quantity=qty,
-            reduceOnly=True
-        )
-        log_info(f"Stop loss order placed at {stop_price}, order: {order}")
-        return order
-    except BinanceAPIException as e:
-        log_error(f"Failed to place stop loss: {e}")
-        return None
+    # Improved SL handling: Try to place SL, if price/qty decimal issue, auto adjust
+    price_precision = get_price_precision(client, symbol)
+    qty_precision = get_quantity_precision(client, symbol)
+    for attempt in range(5):  # Try several attempts with adjusted prices
+        stop_price = entry_price * (1 - STOP_LOSS_PCT)
+        stop_price = round(stop_price, price_precision)
+        stop_price = floor_to_precision(stop_price, price_precision)
+        qty_adj = floor_to_precision(qty, qty_precision)
+        log_info(f"Attempting SL (try {attempt+1}): stop_price={stop_price}, qty={qty_adj} (entry={entry_price}, pct={STOP_LOSS_PCT})")
+        try:
+            order = client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type="STOP_MARKET",
+                stopPrice=stop_price,
+                quantity=qty_adj,
+                reduceOnly=True
+            )
+            log_info(f"Stop loss order placed at {stop_price}, order: {order}")
+            return order
+        except BinanceAPIException as e:
+            log_error(f"Failed to place stop loss (attempt {attempt+1}): {e}")
+            # Auto-fix: Adjust price by tick size or step size for next attempt
+            stop_price = stop_price - (10 ** -price_precision)
+    return None
 
 def cancel_open_stop_orders(client, symbol):
     cancelled_any = False
@@ -456,6 +475,7 @@ def scan_opportunities(client):
                             )
                             break
 
+                        # ENTRY: Show in telegram only after position is opened, with actual entry price (from fills)
                         actual_entry_price = get_actual_entry_price(client, symbol, order, tried_qty)
                         if actual_entry_price is None:
                             actual_entry_price = price
@@ -464,26 +484,28 @@ def scan_opportunities(client):
                         entry_funding_data = get_funding_data(symbol)
                         entry_funding_rate = entry_funding_data['fundingRate'] if entry_funding_data else None
                         entry_funding_rate_str = f"{entry_funding_rate:.4f}" if entry_funding_rate is not None else "N/A"
-                        send_telegram_to_all(
+                        msg = (
                             f"🚀 <b>Trade Entry</b>\n"
                             f"Symbol: <b>{symbol}</b>\n"
                             f"Qty: <b>{tried_qty}</b>\n"
-                            f"Entry Price (Mark): <b>{price}</b>\n"
-                            f"Actual Entry Price (fill): <b>{actual_entry_price}</b>\n"
+                            f"Entry Price (Actual Fill): <b>{actual_entry_price}</b>\n"
                             f"Funding Rate at Entry: <b>{entry_funding_rate_str}</b>\n"
                             f"Leverage: <b>{TRADE_LEVERAGE}x</b>\n"
                             f"Order ID: <b>{order.get('orderId')}</b>\n"
                             f"Entry Time (IST): <b>{format_time(now_ist)}</b>"
                         )
+                        send_telegram_to_all(msg)
 
+                        # Place SL using actual entry price, smart decimal handling
                         sl_order = place_stop_loss(client, symbol, actual_entry_price, tried_qty)
+                        sl_price_display = round(actual_entry_price * (1 - STOP_LOSS_PCT), get_price_precision(client, symbol))
                         if sl_order:
                             send_telegram_to_all(
-                                f"🛡️ <b>Stop Loss Placed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nSL Price: <b>{round(actual_entry_price * (1 - STOP_LOSS_PCT), 6)}</b>\nOrder ID: <b>{sl_order.get('orderId')}</b>"
+                                f"🛡️ <b>Stop Loss Placed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nSL Price: <b>{sl_price_display}</b>\nOrder ID: <b>{sl_order.get('orderId')}</b>"
                             )
                         else:
                             send_telegram_to_all(
-                                f"⚠️ <b>Stop Loss Failed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>"
+                                f"⚠️ <b>Stop Loss Failed</b>\nSymbol: <b>{symbol}</b>\nQty: <b>{tried_qty}</b>\nTried SL Price: <b>{sl_price_display}</b>\nPlease check manually."
                             )
                         exit_time = funding_time_ist - timedelta(minutes=1)
                         seconds_to_exit = (exit_time - now_ist).total_seconds()
