@@ -191,19 +191,23 @@ def place_market_long(client, symbol, qty):
         log_error(f"Order error: {e}")
         return None
 
-def get_actual_entry_price(client, symbol, order, qty):
-    # Try avgFillPrice from order if present
-    if 'avgFillPrice' in order and float(order['avgFillPrice']) > 0:
-        return float(order['avgFillPrice'])
-    try:
-        # Fallback: Get the last trade for this symbol with matching qty and BUY side
-        trades = client.futures_account_trades(symbol=symbol)
-        for trade in reversed(trades):
-            if trade['side'] == 'BUY' and abs(float(trade['qty']) - qty) < 1e-6:
-                return float(trade['price'])
-    except Exception as e:
-        log_error(f"Could not fetch fills for {symbol}: {e}")
-    return None
+def wait_for_filled_order_and_get_entry_price(client, symbol, order_id, side, max_wait=15):
+    """
+    Waits until the order is fully filled and returns (entry_price, executed_qty).
+    """
+    for _ in range(max_wait * 2):  # up to max_wait seconds (0.5s per attempt)
+        order_status = client.futures_get_order(symbol=symbol, orderId=order_id)
+        if order_status['status'] == "FILLED" and float(order_status['executedQty']) > 0:
+            # Now try to get the trade fill price
+            trades = client.futures_account_trades(symbol=symbol)
+            for trade in reversed(trades):
+                if trade['orderId'] == order_id and trade['side'] == side:
+                    return float(trade['price']), float(order_status['executedQty'])
+            avg_price = order_status.get('avgPrice') or order_status.get('avgFillPrice')
+            if avg_price and float(avg_price) > 0:
+                return float(avg_price), float(order_status['executedQty'])
+        time.sleep(0.5)
+    return None, 0  # If still not filled after retries
 
 def get_quantity_precision(client, symbol):
     try:
@@ -475,11 +479,15 @@ def scan_opportunities(client):
                             )
                             break
 
-                        # ENTRY: Show in telegram only after position is opened, with actual entry price (from fills)
-                        actual_entry_price = get_actual_entry_price(client, symbol, order, tried_qty)
-                        if actual_entry_price is None:
+                        # === Wait for the market order to be filled and get true fill price ===
+                        entry_price, filled_qty = wait_for_filled_order_and_get_entry_price(client, symbol, order['orderId'], 'BUY', max_wait=15)
+                        if not entry_price or not filled_qty:
+                            log_error(f"Order {order['orderId']} for {symbol} did not fill in time, reporting mark price.")
                             actual_entry_price = price
-                            log_error(f"Could not determine actual fill price for {symbol}, reporting mark price.")
+                            tried_qty = qty
+                        else:
+                            actual_entry_price = entry_price
+                            tried_qty = filled_qty
 
                         entry_funding_data = get_funding_data(symbol)
                         entry_funding_rate = entry_funding_data['fundingRate'] if entry_funding_data else None
